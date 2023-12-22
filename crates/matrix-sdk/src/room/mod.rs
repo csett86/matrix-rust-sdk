@@ -1214,11 +1214,14 @@ impl Room {
         thread: ReceiptThread,
         event_id: OwnedEventId,
     ) -> Result<()> {
+        tracing::trace!(room_id = %self.room_id(), event_id = %event_id, "Sending read receipt!");
+
         let mut request =
             create_receipt::v3::Request::new(self.room_id().to_owned(), receipt_type, event_id);
         request.thread = thread;
 
         self.client.send(request, None).await?;
+
         Ok(())
     }
 

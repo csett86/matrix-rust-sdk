@@ -54,7 +54,7 @@ use ruma::{
     EventId, OwnedEventId, RoomId, UserId,
 };
 use serde::{Deserialize, Serialize};
-use tracing::{instrument, trace};
+use tracing::{debug, instrument, trace};
 
 use crate::error::Result;
 
@@ -105,6 +105,8 @@ impl RoomReadReceipts {
             }
         }
 
+        trace!(event_id = ?event.event_id(), ?has_unread, ?has_notify, ?has_mention, "Counted for event.");
+
         has_unread || has_notify || has_mention
     }
 
@@ -117,6 +119,7 @@ impl RoomReadReceipts {
 
     /// Try to find the event to which the receipt attaches to, and if found,
     /// will update the notification count in the room.
+    #[instrument(skip_all)]
     fn find_and_count_events<'a>(
         &mut self,
         receipt_event_id: &EventId,
@@ -128,13 +131,19 @@ impl RoomReadReceipts {
         for event in events {
             if counting_receipts {
                 self.update_for_event(event, user_id);
-            } else if let Ok(Some(event_id)) = event.event.get_field::<OwnedEventId>("event_id") {
-                if event_id == receipt_event_id {
-                    // Bingo! Switch over to the counting state, after resetting the
-                    // previous counts.
-                    trace!("Found the event the receipt was referring to! Starting to count.");
-                    self.reset();
-                    counting_receipts = true;
+            } else {
+                let event_id = event.event_id();
+
+                trace!(?event_id, "(still looking for receipt)");
+
+                if let Some(event_id) = event_id {
+                    if event_id == receipt_event_id {
+                        // Bingo! Switch over to the counting state, after resetting the
+                        // previous counts.
+                        trace!("Found the event the receipt was referring to! Starting to count (resetting count).");
+                        self.reset();
+                        counting_receipts = true;
+                    }
                 }
             }
         }
@@ -175,10 +184,11 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
     new_events: &[SyncTimelineEvent],
     read_receipts: &mut RoomReadReceipts,
 ) -> Result<bool> {
+    trace!(num_new_events = %new_events.len(), "Start computing receipt.");
     let prev_latest_receipt_event_id = read_receipts.latest_read_receipt_event_id.clone();
 
     if let Some(receipt_event) = receipt_event {
-        trace!("Got a new receipt event!");
+        trace!("Got a new receipt event, looking for receipt from current user.");
 
         // Find a private or public read receipt for the current user.
         let mut receipt_event_id = None;
@@ -203,7 +213,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
 
             // Try to find if the read receipt refers to an event from the current sync, to
             // avoid searching the cached timeline events.
-            trace!("We got a new event with a read receipt: {receipt_event_id}. Search in new events...");
+            trace!(event_id = %receipt_event_id, "We found a new event related to the read receipt. Search in new events...");
             if read_receipts.find_and_count_events(&receipt_event_id, user_id, new_events) {
                 // It did, so our work here is done.
                 // Always return true here; we saved at least the latest read receipt.
@@ -215,7 +225,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
             // seen. In that case, try to find it.
             let previous_events = previous_events_provider.for_room(room_id);
 
-            trace!("Couldn't find the event attached to the receipt in the new events; looking in past events too now...");
+            trace!("Couldn't find event among new events; looking in cached past events...");
             if read_receipts.find_and_count_events(
                 &receipt_event_id,
                 user_id,
@@ -254,6 +264,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
         }
     }
 
+    trace!("Done computing receipts.");
     Ok(new_receipt)
 }
 
@@ -262,7 +273,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
     let event = match event.deserialize() {
         Ok(event) => event,
         Err(err) => {
-            tracing::debug!(
+            debug!(
                 "couldn't deserialize event {:?}: {err}",
                 event.get_field::<String>("event_id").ok().flatten()
             );
@@ -338,7 +349,7 @@ fn marks_as_unread(event: &Raw<AnySyncTimelineEvent>, user_id: &UserId) -> bool 
 
                 _ => {
                     // What I don't know about, I don't care about.
-                    tracing::debug!("unhandled timeline event type: {}", event.event_type());
+                    debug!("unhandled timeline event type: {}", event.event_type());
                     false
                 }
             }
