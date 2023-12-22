@@ -51,12 +51,21 @@ use ruma::{
         SyncMessageLikeEvent,
     },
     serde::Raw,
-    EventId, OwnedEventId, RoomId, UserId,
+    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, trace};
 
 use crate::error::Result;
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+struct LatestReadReceipt {
+    /// The id of the event the read receipt is referring to. (Not the read receipt event id.)
+    event_id: OwnedEventId,
+
+    /// The timestamp of the event the read receipt is referring to.
+    event_ts: Option<MilliSecondsSinceUnixEpoch>,
+}
 
 /// Information about read receipts collected during processing of that room.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
@@ -71,10 +80,8 @@ pub(crate) struct RoomReadReceipts {
     /// mentions)
     pub num_mentions: u64,
 
-    /// The id of the event the last unthreaded (or main-threaded, for better
-    /// compatibility with clients that have thread support) read receipt is
-    /// attached to.
-    latest_read_receipt_event_id: Option<OwnedEventId>,
+    /// The latest read receipt (main-threaded or unthreaded) known for the room.
+    latest_read_receipt: Option<LatestReadReceipt>,
 }
 
 impl RoomReadReceipts {
@@ -175,13 +182,14 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
     new_events: &[SyncTimelineEvent],
     read_receipts: &mut RoomReadReceipts,
 ) -> Result<bool> {
-    let prev_latest_receipt_event_id = read_receipts.latest_read_receipt_event_id.clone();
+    let prev_latest_receipt = read_receipts.latest_read_receipt.clone();
 
     if let Some(receipt_event) = receipt_event {
         trace!("Got a new receipt event!");
 
         // Find a private or public read receipt for the current user.
-        let mut receipt_event_id = None;
+        let mut new_receipt = None;
+
         if let Some((event_id, receipt)) = receipt_event
             .user_receipt(user_id, ReceiptType::Read)
             .or_else(|| receipt_event.user_receipt(user_id, ReceiptType::ReadPrivate))
@@ -191,20 +199,38 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
                 // The server can return the same receipt multiple times.
                 // Do not consider it if it's the same as the previous one, to avoid doing
                 // wasteful work.
-                if Some(event_id) != prev_latest_receipt_event_id.as_deref() {
-                    receipt_event_id = Some(event_id.to_owned());
+                match prev_latest_receipt.as_ref() {
+                    Some(prev) => {
+                        if prev.event_id != event_id
+                            && prev.event_ts.zip(receipt.ts).map_or(true, |(prev, new)| prev < new)
+                        {
+                            new_receipt = Some(LatestReadReceipt {
+                                event_id: event_id.to_owned(),
+                                event_ts: receipt.ts.clone(),
+                            });
+                        }
+                    }
+
+                    None => {
+                        new_receipt = Some(LatestReadReceipt {
+                            event_id: event_id.to_owned(),
+                            event_ts: receipt.ts.clone(),
+                        });
+                    }
                 }
             }
         }
 
-        if let Some(receipt_event_id) = receipt_event_id {
+        if let Some(new_receipt) = new_receipt {
             // We've found the id of an event to which the receipt attaches. The associated
             // event may either come from the new batch of events associated to
             // this sync, or it may live in the past timeline events we know
             // about.
 
+            let receipt_event_id = new_receipt.event_id.clone();
+
             // First, save the event id as the latest one that has a read receipt.
-            read_receipts.latest_read_receipt_event_id = Some(receipt_event_id.clone());
+            read_receipts.latest_read_receipt = Some(new_receipt);
 
             // Try to find if the read receipt refers to an event from the current sync, to
             // avoid searching the cached timeline events.
@@ -233,7 +259,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
         }
     }
 
-    if let Some(receipt_event_id) = prev_latest_receipt_event_id {
+    if let Some(receipt_event_id) = prev_latest_receipt.map(|prev| prev.event_id) {
         // There's no new read-receipt here. We assume the cached events have been
         // properly processed, and we only need to process the new events based
         // on the previous receipt.
@@ -602,7 +628,7 @@ mod tests {
             num_unread: 42,
             num_notifications: 13,
             num_mentions: 37,
-            latest_read_receipt_event_id: None,
+            latest_read_receipt: None,
         };
         assert!(receipts
             .find_and_count_events(ev0, user_id, &[make_event(event_id!("$1"))],)
@@ -618,7 +644,7 @@ mod tests {
             num_unread: 42,
             num_notifications: 13,
             num_mentions: 37,
-            latest_read_receipt_event_id: None,
+            latest_read_receipt: None,
         };
         assert!(receipts.find_and_count_events(ev0, user_id, &[make_event(ev0)]));
         assert_eq!(receipts.num_unread, 0);
@@ -631,7 +657,7 @@ mod tests {
             num_unread: 42,
             num_notifications: 13,
             num_mentions: 37,
-            latest_read_receipt_event_id: None,
+            latest_read_receipt: None,
         };
         assert!(receipts
             .find_and_count_events(
@@ -654,7 +680,7 @@ mod tests {
             num_unread: 42,
             num_notifications: 13,
             num_mentions: 37,
-            latest_read_receipt_event_id: None,
+            latest_read_receipt: None,
         };
         assert!(receipts.find_and_count_events(
             ev0,
