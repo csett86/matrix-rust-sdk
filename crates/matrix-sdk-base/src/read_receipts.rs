@@ -40,12 +40,14 @@
 //! updates the `RoomInfo` in place according to the new counts.
 #![allow(dead_code)] // too many different build configurations, I give up
 
+use std::collections::BTreeMap;
+
 use eyeball_im::Vector;
 use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
 use ruma::{
     events::{
         poll::{start::PollStartEventContent, unstable_start::UnstablePollStartEventContent},
-        receipt::{ReceiptEventContent, ReceiptThread, ReceiptType},
+        receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType, Receipts},
         room::message::Relation,
         AnySyncMessageLikeEvent, AnySyncTimelineEvent, OriginalSyncMessageLikeEvent,
         SyncMessageLikeEvent,
@@ -163,6 +165,50 @@ impl PreviousEventsProvider for () {
     }
 }
 
+/// Will find the most recent unthreaded or main-threaded receipt in the receipts event.
+fn find_most_recent_receipt(
+    user_id: &UserId,
+    receipts: &BTreeMap<OwnedEventId, Receipts>,
+) -> Option<(OwnedEventId, Receipt)> {
+    receipts.iter().fold(None, |acc, (event_id, receipts)| {
+        let mut found: Option<&Receipt> = None;
+
+        // For both the public and private read receipts,
+        for ty in [ReceiptType::Read, ReceiptType::ReadPrivate] {
+            // Try to find a receipt for the current user for that event,
+            if let Some(receipt) = receipts.get(&ty).and_then(|receipts| receipts.get(user_id)) {
+                // that's a main-threaded or unthreaded read receipt,
+                if matches!(receipt.thread, ReceiptThread::Main | ReceiptThread::Unthreaded) {
+                    // and take it if it's the first found receipt for that user, or if the
+                    // provided timestamp of this receipt is more recent than the previous one
+                    // we've found.
+                    if found.as_ref().map_or(true, |prev_receipt| {
+                        prev_receipt.ts.zip(receipt.ts).map_or(false, |(prev, new)| prev < new)
+                    }) {
+                        found = Some(receipt);
+                    }
+                }
+            }
+        }
+
+        // If we found such a receipt,
+        if let Some(receipt) = found {
+            // compare it against the previous read receipt we accumulated, and take it if:
+            // - it's the first read receipt for that user
+            // - or the associated event has a more-recent timestamp than the previous one.
+            if acc.as_ref().map_or(true, |prev_receipt| {
+                prev_receipt.1.ts.zip(receipt.ts).map_or(false, |(prev, new)| prev < new)
+            }) {
+                Some((event_id.clone(), receipt.clone()))
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    })
+}
+
 /// Given a set of events coming from sync, for a room, update the
 /// [`RoomReadReceipts`]'s counts of unread messages, notifications and
 /// highlights' in place.
@@ -190,10 +236,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
         // Find a private or public read receipt for the current user.
         let mut new_receipt = None;
 
-        if let Some((event_id, receipt)) = receipt_event
-            .user_receipt(user_id, ReceiptType::Read)
-            .or_else(|| receipt_event.user_receipt(user_id, ReceiptType::ReadPrivate))
-        {
+        if let Some((event_id, receipt)) = find_most_recent_receipt(user_id, &receipt_event.0) {
             if receipt.thread == ReceiptThread::Unthreaded || receipt.thread == ReceiptThread::Main
             {
                 // The server can return the same receipt multiple times.
