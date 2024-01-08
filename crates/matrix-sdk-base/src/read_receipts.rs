@@ -69,7 +69,7 @@ struct LatestReadReceipt {
     event_ts: Option<MilliSecondsSinceUnixEpoch>,
 }
 
-/// Information about read receipts collected during processing of that room.
+/// Public data about read receipts collected during processing of that room.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub(crate) struct RoomReadReceipts {
     /// Does the room have unread messages?
@@ -83,6 +83,7 @@ pub(crate) struct RoomReadReceipts {
     pub num_mentions: u64,
 
     /// The latest read receipt (main-threaded or unthreaded) known for the room.
+    /// TODO: move this over to the `Room` struct, no need to memoize it here
     latest_read_receipt: Option<LatestReadReceipt>,
 }
 
@@ -92,7 +93,7 @@ impl RoomReadReceipts {
     ///
     /// Returns whether a new event triggered a new unread/notification/mention.
     #[inline(always)]
-    fn update_for_event(&mut self, event: &SyncTimelineEvent, user_id: &UserId) -> bool {
+    fn account_event(&mut self, event: &SyncTimelineEvent, user_id: &UserId) -> bool {
         let mut has_unread = false;
 
         if marks_as_unread(&event.event, user_id) {
@@ -126,7 +127,7 @@ impl RoomReadReceipts {
 
     /// Try to find the event to which the receipt attaches to, and if found,
     /// will update the notification count in the room.
-    fn find_and_count_events<'a>(
+    fn find_and_account_events<'a>(
         &mut self,
         receipt_event_id: &EventId,
         user_id: &UserId,
@@ -136,7 +137,7 @@ impl RoomReadReceipts {
 
         for event in events {
             if counting_receipts {
-                self.update_for_event(event, user_id);
+                self.account_event(event, user_id);
             } else if let Ok(Some(event_id)) = event.event.get_field::<OwnedEventId>("event_id") {
                 if event_id == receipt_event_id {
                     // Bingo! Switch over to the counting state, after resetting the
@@ -278,7 +279,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
             // Try to find if the read receipt refers to an event from the current sync, to
             // avoid searching the cached timeline events.
             trace!("We got a new event with a read receipt: {receipt_event_id}. Search in new events...");
-            if read_receipts.find_and_count_events(&receipt_event_id, user_id, new_events) {
+            if read_receipts.find_and_account_events(&receipt_event_id, user_id, new_events) {
                 // It did, so our work here is done.
                 // Always return true here; we saved at least the latest read receipt.
                 return Ok(true);
@@ -290,7 +291,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
             let previous_events = previous_events_provider.for_room(room_id);
 
             trace!("Couldn't find the event attached to the receipt in the new events; looking in past events too now...");
-            if read_receipts.find_and_count_events(
+            if read_receipts.find_and_account_events(
                 &receipt_event_id,
                 user_id,
                 previous_events.iter().chain(new_events.iter()),
@@ -307,7 +308,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
         // properly processed, and we only need to process the new events based
         // on the previous receipt.
         trace!("No new receipts, or couldn't find attached event; looking if the past latest known receipt refers to a new event...");
-        if read_receipts.find_and_count_events(&receipt_event_id, user_id, new_events) {
+        if read_receipts.find_and_account_events(&receipt_event_id, user_id, new_events) {
             // We found the event to which the previous receipt attached to (so we at least
             // reset the counts once), our work is done here.
             return Ok(true);
@@ -323,7 +324,7 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
     trace!("Default path: including all new events for the receipts count.");
     let mut new_receipt = false;
     for event in new_events {
-        if read_receipts.update_for_event(event, user_id) {
+        if read_receipts.account_event(event, user_id) {
             new_receipt = true;
         }
     }
@@ -587,7 +588,7 @@ mod tests {
         // An interesting event from oneself doesn't count as a new unread message.
         let event = make_event(user_id, Vec::new());
         let mut receipts = RoomReadReceipts::default();
-        receipts.update_for_event(&event, user_id);
+        receipts.account_event(&event, user_id);
         assert_eq!(receipts.num_unread, 0);
         assert_eq!(receipts.num_mentions, 0);
         assert_eq!(receipts.num_notifications, 0);
@@ -595,7 +596,7 @@ mod tests {
         // An interesting event from someone else does count as a new unread message.
         let event = make_event(user_id!("@bob:example.org"), Vec::new());
         let mut receipts = RoomReadReceipts::default();
-        receipts.update_for_event(&event, user_id);
+        receipts.account_event(&event, user_id);
         assert_eq!(receipts.num_unread, 1);
         assert_eq!(receipts.num_mentions, 0);
         assert_eq!(receipts.num_notifications, 0);
@@ -603,7 +604,7 @@ mod tests {
         // Push actions computed beforehand are respected.
         let event = make_event(user_id!("@bob:example.org"), vec![Action::Notify]);
         let mut receipts = RoomReadReceipts::default();
-        receipts.update_for_event(&event, user_id);
+        receipts.account_event(&event, user_id);
         assert_eq!(receipts.num_unread, 1);
         assert_eq!(receipts.num_mentions, 0);
         assert_eq!(receipts.num_notifications, 1);
@@ -613,7 +614,7 @@ mod tests {
             vec![Action::SetTweak(ruma::push::Tweak::Highlight(true))],
         );
         let mut receipts = RoomReadReceipts::default();
-        receipts.update_for_event(&event, user_id);
+        receipts.account_event(&event, user_id);
         assert_eq!(receipts.num_unread, 1);
         assert_eq!(receipts.num_mentions, 1);
         assert_eq!(receipts.num_notifications, 0);
@@ -623,7 +624,7 @@ mod tests {
             vec![Action::SetTweak(ruma::push::Tweak::Highlight(true)), Action::Notify],
         );
         let mut receipts = RoomReadReceipts::default();
-        receipts.update_for_event(&event, user_id);
+        receipts.account_event(&event, user_id);
         assert_eq!(receipts.num_unread, 1);
         assert_eq!(receipts.num_mentions, 1);
         assert_eq!(receipts.num_notifications, 1);
@@ -632,7 +633,7 @@ mod tests {
         // make sure to resist against it.
         let event = make_event(user_id!("@bob:example.org"), vec![Action::Notify, Action::Notify]);
         let mut receipts = RoomReadReceipts::default();
-        receipts.update_for_event(&event, user_id);
+        receipts.account_event(&event, user_id);
         assert_eq!(receipts.num_unread, 1);
         assert_eq!(receipts.num_mentions, 0);
         assert_eq!(receipts.num_notifications, 1);
@@ -646,7 +647,7 @@ mod tests {
         // When provided with no events, we report not finding the event to which the
         // receipt relates.
         let mut receipts = RoomReadReceipts::default();
-        assert!(receipts.find_and_count_events(ev0, user_id, &[]).not());
+        assert!(receipts.find_and_account_events(ev0, user_id, &[]).not());
         assert_eq!(receipts.num_unread, 0);
         assert_eq!(receipts.num_notifications, 0);
         assert_eq!(receipts.num_mentions, 0);
@@ -674,7 +675,7 @@ mod tests {
             latest_read_receipt: None,
         };
         assert!(receipts
-            .find_and_count_events(ev0, user_id, &[make_event(event_id!("$1"))],)
+            .find_and_account_events(ev0, user_id, &[make_event(event_id!("$1"))],)
             .not());
         assert_eq!(receipts.num_unread, 42);
         assert_eq!(receipts.num_notifications, 13);
@@ -689,7 +690,7 @@ mod tests {
             num_mentions: 37,
             latest_read_receipt: None,
         };
-        assert!(receipts.find_and_count_events(ev0, user_id, &[make_event(ev0)]));
+        assert!(receipts.find_and_account_events(ev0, user_id, &[make_event(ev0)]));
         assert_eq!(receipts.num_unread, 0);
         assert_eq!(receipts.num_notifications, 0);
         assert_eq!(receipts.num_mentions, 0);
@@ -703,7 +704,7 @@ mod tests {
             latest_read_receipt: None,
         };
         assert!(receipts
-            .find_and_count_events(
+            .find_and_account_events(
                 ev0,
                 user_id,
                 &[
@@ -725,7 +726,7 @@ mod tests {
             num_mentions: 37,
             latest_read_receipt: None,
         };
-        assert!(receipts.find_and_count_events(
+        assert!(receipts.find_and_account_events(
             ev0,
             user_id,
             &[
