@@ -40,20 +40,20 @@
 //! updates the `RoomInfo` in place according to the new counts.
 #![allow(dead_code)] // too many different build configurations, I give up
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use eyeball_im::Vector;
 use matrix_sdk_common::deserialized_responses::SyncTimelineEvent;
 use ruma::{
     events::{
         poll::{start::PollStartEventContent, unstable_start::UnstablePollStartEventContent},
-        receipt::{Receipt, ReceiptEventContent, ReceiptThread, ReceiptType, Receipts},
+        receipt::{ReceiptEventContent, ReceiptThread, ReceiptType},
         room::message::Relation,
         AnySyncMessageLikeEvent, AnySyncTimelineEvent, OriginalSyncMessageLikeEvent,
         SyncMessageLikeEvent,
     },
     serde::Raw,
-    EventId, MilliSecondsSinceUnixEpoch, OwnedEventId, RoomId, UserId,
+    EventId, OwnedEventId, RoomId, UserId,
 };
 use serde::{Deserialize, Serialize};
 use tracing::{instrument, trace};
@@ -62,11 +62,9 @@ use crate::error::Result;
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct LatestReadReceipt {
-    /// The id of the event the read receipt is referring to. (Not the read receipt event id.)
+    /// The id of the event the read receipt is referring to. (Not the read
+    /// receipt event id.)
     event_id: OwnedEventId,
-
-    /// The timestamp of the event the read receipt is referring to.
-    event_ts: Option<MilliSecondsSinceUnixEpoch>,
 }
 
 /// Public data about read receipts collected during processing of that room.
@@ -82,9 +80,20 @@ pub(crate) struct RoomReadReceipts {
     /// mentions)
     pub num_mentions: u64,
 
-    /// The latest read receipt (main-threaded or unthreaded) known for the room.
-    /// TODO: move this over to the `Room` struct, no need to memoize it here
-    latest_read_receipt: Option<LatestReadReceipt>,
+    /// The latest read receipt (main-threaded or unthreaded) known for the
+    /// room. TODO: move this over to the `Room` struct, no need to memoize
+    /// it here
+    latest_active: Option<LatestReadReceipt>,
+
+    /// Read receipts that haven't been matched to their event.
+    ///
+    /// This might mean that the read receipt is in the past further than we
+    /// recall (i.e. before the first event we've ever cached), or in the
+    /// future (i.e. the event is lagging behind because of federation).
+    ///
+    /// Note: this contains event ids of the event *targets* of the receipts,
+    /// not the event ids of the receipt events themselves.
+    pending: BTreeSet<OwnedEventId>,
 }
 
 impl RoomReadReceipts {
@@ -138,7 +147,7 @@ impl RoomReadReceipts {
         for event in events {
             if counting_receipts {
                 self.account_event(event, user_id);
-            } else if let Ok(Some(event_id)) = event.event.get_field::<OwnedEventId>("event_id") {
+            } else if let Some(event_id) = event.event_id() {
                 if event_id == receipt_event_id {
                     // Bingo! Switch over to the counting state, after resetting the
                     // previous counts.
@@ -166,50 +175,6 @@ impl PreviousEventsProvider for () {
     }
 }
 
-/// Will find the most recent unthreaded or main-threaded receipt in the receipts event.
-fn find_most_recent_receipt(
-    user_id: &UserId,
-    receipts: &BTreeMap<OwnedEventId, Receipts>,
-) -> Option<(OwnedEventId, Receipt)> {
-    receipts.iter().fold(None, |acc, (event_id, receipts)| {
-        let mut found: Option<&Receipt> = None;
-
-        // For both the public and private read receipts,
-        for ty in [ReceiptType::Read, ReceiptType::ReadPrivate] {
-            // Try to find a receipt for the current user for that event,
-            if let Some(receipt) = receipts.get(&ty).and_then(|receipts| receipts.get(user_id)) {
-                // that's a main-threaded or unthreaded read receipt,
-                if matches!(receipt.thread, ReceiptThread::Main | ReceiptThread::Unthreaded) {
-                    // and take it if it's the first found receipt for that user, or if the
-                    // provided timestamp of this receipt is more recent than the previous one
-                    // we've found.
-                    if found.as_ref().map_or(true, |prev_receipt| {
-                        prev_receipt.ts.zip(receipt.ts).map_or(false, |(prev, new)| prev < new)
-                    }) {
-                        found = Some(receipt);
-                    }
-                }
-            }
-        }
-
-        // If we found such a receipt,
-        if let Some(receipt) = found {
-            // compare it against the previous read receipt we accumulated, and take it if:
-            // - it's the first read receipt for that user
-            // - or the associated event has a more-recent timestamp than the previous one.
-            if acc.as_ref().map_or(true, |prev_receipt| {
-                prev_receipt.1.ts.zip(receipt.ts).map_or(false, |(prev, new)| prev < new)
-            }) {
-                Some((event_id.clone(), receipt.clone()))
-            } else {
-                None
-            }
-        } else {
-            None
-        }
-    })
-}
-
 /// Given a set of events coming from sync, for a room, update the
 /// [`RoomReadReceipts`]'s counts of unread messages, notifications and
 /// highlights' in place.
@@ -229,99 +194,121 @@ pub(crate) fn compute_notifications<PEP: PreviousEventsProvider>(
     new_events: &[SyncTimelineEvent],
     read_receipts: &mut RoomReadReceipts,
 ) -> Result<bool> {
-    let prev_latest_receipt = read_receipts.latest_read_receipt.clone();
+    // Index all the events (from event_id to their position in the sync stream).
+    // TODO: partially cache this index, invalidate upon gappy sync
+    let mut all_events = previous_events_provider.for_room(room_id);
+    all_events.extend(new_events.iter().cloned());
+
+    let event_id_to_pos =
+        BTreeMap::from_iter(all_events.iter().enumerate().filter_map(|(pos, event)| {
+            event.event_id().and_then(|event_id| Some((event_id, pos)))
+        }));
+
+    // We're looking for a receipt that has a position that is at least further (>)
+    // than the one we knew about (if any).
+    let mut best_receipt = None;
+    let mut best_pos = read_receipts
+        .latest_active
+        .as_ref()
+        .and_then(|r| event_id_to_pos.get(&r.event_id))
+        .copied();
+
+    // Try to match stashes receipts against the new events.
+    read_receipts.pending.retain(|event_id| {
+        if let Some(event_pos) = event_id_to_pos.get(event_id) {
+            // We now have a position for an event that had a read receipt, but wasn't found
+            // before. Consider if it is the most recent now.
+            if let Some(best_pos) = best_pos.as_mut() {
+                // Note: by using a strict comparison here, we protect against the
+                // server sending a receipt on the same event multiple times.
+                if *event_pos > *best_pos {
+                    *best_pos = *event_pos;
+                    best_receipt = Some(event_id.clone());
+                }
+            } else {
+                // We didn't have a previous receipt, this is the first one we
+                // store: remember it.
+                best_pos = Some(*event_pos);
+                best_receipt = Some(event_id.clone());
+            }
+
+            // Remove this stashed read receipt from the pending list, as it's been
+            // reconciled with its event.
+            false
+        } else {
+            // Keep it for further iterations.
+            true
+        }
+    });
 
     if let Some(receipt_event) = receipt_event {
         trace!("Got a new receipt event!");
 
-        // Find a private or public read receipt for the current user.
-        let mut new_receipt = None;
-
-        if let Some((event_id, receipt)) = find_most_recent_receipt(user_id, &receipt_event.0) {
-            if receipt.thread == ReceiptThread::Unthreaded || receipt.thread == ReceiptThread::Main
-            {
-                // The server can return the same receipt multiple times.
-                // Do not consider it if it's the same as the previous one, to avoid doing
-                // wasteful work.
-                match prev_latest_receipt.as_ref() {
-                    Some(prev) => {
-                        if prev.event_id != event_id
-                            && prev.event_ts.zip(receipt.ts).map_or(true, |(prev, new)| prev < new)
-                        {
-                            new_receipt = Some(LatestReadReceipt {
-                                event_id: event_id.to_owned(),
-                                event_ts: receipt.ts.clone(),
-                            });
+        // Now consider new receipts.
+        for (event_id, receipts) in &receipt_event.0 {
+            for ty in [ReceiptType::Read, ReceiptType::ReadPrivate] {
+                if let Some(receipt) = receipts.get(&ty).and_then(|receipts| receipts.get(user_id))
+                {
+                    if matches!(receipt.thread, ReceiptThread::Main | ReceiptThread::Unthreaded) {
+                        if let Some(event_pos) = event_id_to_pos.get(event_id) {
+                            if let Some(best_pos) = best_pos.as_mut() {
+                                // Note: by using a strict comparison here, we protect against the
+                                // server sending a receipt on the same event multiple times.
+                                if *event_pos > *best_pos {
+                                    *best_pos = *event_pos;
+                                    best_receipt = Some(event_id.clone());
+                                }
+                            } else {
+                                // We didn't have a previous receipt, this is the first one we
+                                // store: remember it.
+                                best_pos = Some(*event_pos);
+                                best_receipt = Some(event_id.clone());
+                            }
+                        } else {
+                            // It's a new pending receipt.
+                            read_receipts.pending.insert(event_id.clone());
                         }
-                    }
-
-                    None => {
-                        new_receipt = Some(LatestReadReceipt {
-                            event_id: event_id.to_owned(),
-                            event_ts: receipt.ts.clone(),
-                        });
                     }
                 }
             }
         }
-
-        if let Some(new_receipt) = new_receipt {
-            // We've found the id of an event to which the receipt attaches. The associated
-            // event may either come from the new batch of events associated to
-            // this sync, or it may live in the past timeline events we know
-            // about.
-
-            let receipt_event_id = new_receipt.event_id.clone();
-
-            // First, save the event id as the latest one that has a read receipt.
-            read_receipts.latest_read_receipt = Some(new_receipt);
-
-            // Try to find if the read receipt refers to an event from the current sync, to
-            // avoid searching the cached timeline events.
-            trace!("We got a new event with a read receipt: {receipt_event_id}. Search in new events...");
-            if read_receipts.find_and_account_events(&receipt_event_id, user_id, new_events) {
-                // It did, so our work here is done.
-                // Always return true here; we saved at least the latest read receipt.
-                return Ok(true);
-            }
-
-            // We didn't find the event attached to the receipt in the new batches of
-            // events. It's possible it's referring to an event we've already
-            // seen. In that case, try to find it.
-            let previous_events = previous_events_provider.for_room(room_id);
-
-            trace!("Couldn't find the event attached to the receipt in the new events; looking in past events too now...");
-            if read_receipts.find_and_account_events(
-                &receipt_event_id,
-                user_id,
-                previous_events.iter().chain(new_events.iter()),
-            ) {
-                // It did refer to an old event, so our work here is done.
-                // Always return true here; we saved at least the latest read receipt.
-                return Ok(true);
-            }
-        }
     }
 
-    if let Some(receipt_event_id) = prev_latest_receipt.map(|prev| prev.event_id) {
-        // There's no new read-receipt here. We assume the cached events have been
-        // properly processed, and we only need to process the new events based
-        // on the previous receipt.
-        trace!("No new receipts, or couldn't find attached event; looking if the past latest known receipt refers to a new event...");
-        if read_receipts.find_and_account_events(&receipt_event_id, user_id, new_events) {
-            // We found the event to which the previous receipt attached to (so we at least
-            // reset the counts once), our work is done here.
-            return Ok(true);
-        }
+    // I swear the `LatestReadReceipt` might get handy at some point.
+    let new_receipt = best_receipt.map(|r| LatestReadReceipt { event_id: r.clone() });
+
+    if let Some(new_receipt) = new_receipt {
+        // We've found the id of an event to which the receipt attaches. The associated
+        // event may either come from the new batch of events associated to
+        // this sync, or it may live in the past timeline events we know
+        // about.
+
+        let event_id = new_receipt.event_id.clone();
+
+        // First, save the event id as the latest one that has a read receipt.
+        trace!(%event_id, "Saving a new active read receipt");
+        read_receipts.latest_active = Some(new_receipt);
+
+        // The event for the receipt is in `all_events`, so we'll find it and can count
+        // safely from here.
+        return Ok(read_receipts.find_and_account_events(&event_id, user_id, &all_events));
     }
 
-    // If we haven't returned at this point, it means that either we had no previous
-    // read receipt, or the previous read receipt was not attached to any new
-    // event.
+    // If we haven't returned at this point, it means:
+    // - we didn't have an active read receipt, *or* we had one and it hasn't been
+    //   replaced,
+    // - all pending receipts refered to events we still don't know about,
+    // - there was no new receipt event, *or* all receipts mentioned in that event
+    //   were older than
+    // the active one.
     //
     // In that case, accumulate all events as part of the current batch, and wait
     // for the next receipt.
-    trace!("Default path: including all new events for the receipts count.");
+
+    trace!(
+        "Default path: no new active read receipt, so including all {} new events.",
+        new_events.len()
+    );
     let mut new_receipt = false;
     for event in new_events {
         if read_receipts.account_event(event, user_id) {
@@ -672,7 +659,7 @@ mod tests {
             num_unread: 42,
             num_notifications: 13,
             num_mentions: 37,
-            latest_read_receipt: None,
+            ..Default::default()
         };
         assert!(receipts
             .find_and_account_events(ev0, user_id, &[make_event(event_id!("$1"))],)
@@ -688,7 +675,7 @@ mod tests {
             num_unread: 42,
             num_notifications: 13,
             num_mentions: 37,
-            latest_read_receipt: None,
+            ..Default::default()
         };
         assert!(receipts.find_and_account_events(ev0, user_id, &[make_event(ev0)]));
         assert_eq!(receipts.num_unread, 0);
@@ -701,7 +688,7 @@ mod tests {
             num_unread: 42,
             num_notifications: 13,
             num_mentions: 37,
-            latest_read_receipt: None,
+            ..Default::default()
         };
         assert!(receipts
             .find_and_account_events(
@@ -724,7 +711,7 @@ mod tests {
             num_unread: 42,
             num_notifications: 13,
             num_mentions: 37,
-            latest_read_receipt: None,
+            ..Default::default()
         };
         assert!(receipts.find_and_account_events(
             ev0,
