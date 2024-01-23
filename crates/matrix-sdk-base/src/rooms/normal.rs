@@ -70,6 +70,12 @@ use crate::{
     MinimalStateEvent, OriginalMinimalStateEvent, RoomMemberships,
 };
 
+#[derive(Debug, Clone)]
+pub struct RoomInfoUpdate {
+    pub room_id: OwnedRoomId,
+    pub trigger_room_list_update: bool,
+}
+
 /// The underlying room data structure collecting state for joined, left and
 /// invited rooms.
 #[derive(Debug, Clone)]
@@ -77,7 +83,7 @@ pub struct Room {
     room_id: OwnedRoomId,
     own_user_id: OwnedUserId,
     inner: SharedObservable<RoomInfo>,
-    roominfo_update_sender: broadcast::Sender<OwnedRoomId>,
+    roominfo_update_sender: broadcast::Sender<RoomInfoUpdate>,
     store: Arc<DynStateStore>,
 
     /// The most recent few encrypted events. When the keys come through to
@@ -145,7 +151,7 @@ impl Room {
         store: Arc<DynStateStore>,
         room_id: &RoomId,
         room_state: RoomState,
-        roominfo_update_sender: broadcast::Sender<OwnedRoomId>,
+        roominfo_update_sender: broadcast::Sender<RoomInfoUpdate>,
     ) -> Self {
         let room_info = RoomInfo::new(room_id, room_state);
         Self::restore(own_user_id, store, room_info, roominfo_update_sender)
@@ -155,7 +161,7 @@ impl Room {
         own_user_id: &UserId,
         store: Arc<DynStateStore>,
         room_info: RoomInfo,
-        roominfo_update_sender: broadcast::Sender<OwnedRoomId>,
+        roominfo_update_sender: broadcast::Sender<RoomInfoUpdate>,
     ) -> Self {
         Self {
             own_user_id: own_user_id.into(),
@@ -644,11 +650,13 @@ impl Room {
 
     /// Update the summary with given RoomInfo. This also triggers an update for
     /// the roominfo_update_recv.
-    pub fn set_room_info(&self, room_info: RoomInfo) {
+    pub fn set_room_info(&self, room_info: RoomInfo, trigger_room_list_update: bool) {
         self.inner.set(room_info);
 
         // Ignore error if no receiver exists
-        let _ = self.roominfo_update_sender.send(self.room_id.clone());
+        let _ = self
+            .roominfo_update_sender
+            .send(RoomInfoUpdate { room_id: self.room_id.clone(), trigger_room_list_update });
     }
 
     /// Get the `RoomMember` with the given `user_id`.
@@ -1737,7 +1745,7 @@ mod tests {
         stream_assert::assert_pending!(room_info_subscriber);
 
         // Then updating the room info will store the event,
-        client.apply_changes(&changes);
+        client.apply_changes(&changes, false);
         assert_eq!(room.latest_event().unwrap().event_id(), event.event_id());
 
         // And wake up the subscriber.
@@ -1759,7 +1767,7 @@ mod tests {
         let event = make_latest_event("$A");
         let mut changes = StateChanges::default();
         room.on_latest_event_decrypted(event.clone(), 0, &mut changes);
-        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap());
+        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap(), false);
 
         // Then is it stored
         assert_eq!(room.latest_event().unwrap().event_id(), event.event_id());
@@ -1781,7 +1789,7 @@ mod tests {
         let new_event_index = 1;
         let mut changes = StateChanges::default();
         room.on_latest_event_decrypted(new_event.clone(), new_event_index, &mut changes);
-        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap());
+        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap(), false);
 
         // Then the encrypted events list is shortened to only newer events
         let enc_evs = room.latest_encrypted_events();
@@ -1808,7 +1816,7 @@ mod tests {
         let new_event_index = 3;
         let mut changes = StateChanges::default();
         room.on_latest_event_decrypted(new_event, new_event_index, &mut changes);
-        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap());
+        room.set_room_info(changes.room_infos.get(room.room_id()).cloned().unwrap(), false);
 
         // Then the encrypted events list ie empty
         let enc_evs = room.latest_encrypted_events();
