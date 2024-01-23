@@ -3248,6 +3248,7 @@ dependencies = [
  "assert_matches2",
  "assign",
  "eyeball-im",
+ "futures",
  "futures-core",
  "futures-util",
  "http",
@@ -3256,10 +3257,13 @@ dependencies = [
  "matrix-sdk-ui",
  "once_cell",
  "rand 0.8.5",
+ "reqwest",
+ "serde_json",
  "stream_assert",
  "tempfile",
  "tokio",
  "tracing",
+ "wiremock",
 ]
 
 [[package]]
