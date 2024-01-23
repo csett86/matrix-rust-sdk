@@ -16,7 +16,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
     fmt, iter,
-    sync::RwLock as StdRwLock,
 };
 #[cfg(feature = "e2e-encryption")]
 use std::{ops::Deref, sync::Arc};
@@ -95,7 +94,9 @@ pub struct BaseClient {
     olm_machine: Arc<RwLock<Option<OlmMachine>>>,
     /// Observable of when a user is ignored/unignored.
     pub(crate) ignore_user_list_changes: SharedObservable<()>,
-    pub(crate) roominfo_update_sender: Arc<StdRwLock<Option<broadcast::Sender<OwnedRoomId>>>>,
+
+    pub(crate) roominfo_update_sender: broadcast::Sender<OwnedRoomId>,
+    pub(crate) roominfo_update_receiver: Arc<broadcast::Receiver<OwnedRoomId>>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -121,6 +122,9 @@ impl BaseClient {
     /// * `config` - An optional session if the user already has one from a
     /// previous login call.
     pub fn with_store_config(config: StoreConfig) -> Self {
+        let (roominfo_update_sender, roominfo_update_receiver) =
+            tokio::sync::broadcast::channel(100);
+
         BaseClient {
             store: Store::new(config.state_store),
             #[cfg(feature = "e2e-encryption")]
@@ -128,14 +132,9 @@ impl BaseClient {
             #[cfg(feature = "e2e-encryption")]
             olm_machine: Default::default(),
             ignore_user_list_changes: Default::default(),
-            roominfo_update_sender: Arc::new(StdRwLock::new(None)),
+            roominfo_update_sender,
+            roominfo_update_receiver: Arc::new(roominfo_update_receiver),
         }
-    }
-
-    /// Replaces the sender that triggers updates when room info changes. This
-    /// should only be used once at initialization.
-    pub fn set_roominfo_update_sender(&self, sender: broadcast::Sender<OwnedRoomId>) {
-        *self.roominfo_update_sender.write().unwrap() = Some(sender);
     }
 
     /// Clones the current base client to use the same crypto store but a
@@ -171,11 +170,7 @@ impl BaseClient {
     /// Lookup the Room for the given RoomId, or create one, if it didn't exist
     /// yet in the store
     pub fn get_or_create_room(&self, room_id: &RoomId, room_state: RoomState) -> Room {
-        self.store.get_or_create_room(
-            room_id,
-            room_state,
-            &self.roominfo_update_sender.read().unwrap(),
-        )
+        self.store.get_or_create_room(room_id, room_state, self.roominfo_update_sender.clone())
     }
 
     /// Get all the rooms this client knows about.
@@ -693,7 +688,7 @@ impl BaseClient {
         let room = self.store.get_or_create_room(
             room_id,
             RoomState::Joined,
-            &self.roominfo_update_sender.read().unwrap(),
+            self.roominfo_update_sender.clone(),
         );
         if room.state() != RoomState::Joined {
             let _sync_lock = self.sync_lock().read().await;
@@ -718,7 +713,7 @@ impl BaseClient {
         let room = self.store.get_or_create_room(
             room_id,
             RoomState::Left,
-            &self.roominfo_update_sender.read().unwrap(),
+            self.roominfo_update_sender.clone(),
         );
         if room.state() != RoomState::Left {
             let _sync_lock = self.sync_lock().read().await;
@@ -792,7 +787,7 @@ impl BaseClient {
             let room = self.store.get_or_create_room(
                 &room_id,
                 RoomState::Joined,
-                &self.roominfo_update_sender.read().unwrap(),
+                self.roominfo_update_sender.clone(),
             );
             let mut room_info = room.clone_info();
             room_info.mark_as_joined();
@@ -891,7 +886,7 @@ impl BaseClient {
             let room = self.store.get_or_create_room(
                 &room_id,
                 RoomState::Left,
-                &self.roominfo_update_sender.read().unwrap(),
+                self.roominfo_update_sender.clone(),
             );
             let mut room_info = room.clone_info();
             room_info.mark_as_left();
@@ -940,7 +935,7 @@ impl BaseClient {
             let room = self.store.get_or_create_room(
                 &room_id,
                 RoomState::Invited,
-                &self.roominfo_update_sender.read().unwrap(),
+                self.roominfo_update_sender.clone(),
             );
             let mut room_info = room.clone_info();
             room_info.mark_as_invited();
@@ -1357,6 +1352,10 @@ impl BaseClient {
                 }
             })
             .collect()
+    }
+
+    pub fn roominfo_update_receiver(&self) -> &broadcast::Receiver<OwnedRoomId> {
+        &self.roominfo_update_receiver
     }
 }
 

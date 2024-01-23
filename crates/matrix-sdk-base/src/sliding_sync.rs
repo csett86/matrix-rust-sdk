@@ -460,7 +460,7 @@ impl BaseClient {
             let room = store.get_or_create_room(
                 room_id,
                 RoomState::Invited,
-                &self.roominfo_update_sender.read().unwrap(),
+                self.roominfo_update_sender.clone(),
             );
             let mut room_info = room.clone_info();
 
@@ -486,7 +486,7 @@ impl BaseClient {
             let room = store.get_or_create_room(
                 room_id,
                 RoomState::Joined,
-                &self.roominfo_update_sender.read().unwrap(),
+                self.roominfo_update_sender.clone(),
             );
             let mut room_info = room.clone_info();
 
@@ -1501,12 +1501,14 @@ mod tests {
     }
 
     fn make_room() -> Room {
+        let (sender, _receiver) = tokio::sync::broadcast::channel(1);
+
         Room::new(
             user_id!("@u:e.co"),
             Arc::new(MemoryStore::new()),
             room_id!("!r:e.co"),
             RoomState::Joined,
-            None,
+            sender,
         )
     }
 
