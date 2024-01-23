@@ -13,6 +13,7 @@ assign = "1"
 eyeball-im = { workspace = true }
 futures-core = { workspace = true }
 futures-util = { workspace = true }
+http = "0.2.11"
 matrix-sdk = { workspace = true, default-features = true, features = ["testing", "qrcode"] }
 matrix-sdk-ui = { workspace = true, default-features = true }
 matrix-sdk-test = { workspace = true }

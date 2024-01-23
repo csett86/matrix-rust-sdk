@@ -3250,6 +3250,7 @@ dependencies = [
  "eyeball-im",
  "futures-core",
  "futures-util",
+ "http",
  "matrix-sdk",
  "matrix-sdk-test",
  "matrix-sdk-ui",

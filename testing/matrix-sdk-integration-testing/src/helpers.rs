@@ -9,6 +9,7 @@ use std::{
 use anyhow::Result;
 use assign::assign;
 use matrix_sdk::{
+    bytes::Bytes,
     config::{RequestConfig, SyncSettings},
     ruma::api::client::{account::register::v3::Request as RegistrationRequest, uiaa},
     Client,
@@ -24,11 +25,17 @@ pub struct TestClientBuilder {
     username: String,
     use_sqlite: bool,
     bootstrap_cross_signing: bool,
+    response_preprocessor: Option<fn(&http::Request<Bytes>, &mut http::Response<Bytes>)>,
 }
 
 impl TestClientBuilder {
     pub fn new(username: impl Into<String>) -> Self {
-        Self { username: username.into(), use_sqlite: false, bootstrap_cross_signing: false }
+        Self {
+            username: username.into(),
+            use_sqlite: false,
+            bootstrap_cross_signing: false,
+            response_preprocessor: None,
+        }
     }
 
     pub fn randomize_username(mut self) -> Self {
@@ -44,6 +51,14 @@ impl TestClientBuilder {
 
     pub fn bootstrap_cross_signing(mut self) -> Self {
         self.bootstrap_cross_signing = true;
+        self
+    }
+
+    pub fn response_preprocessor(
+        mut self,
+        r: fn(&http::Request<Bytes>, &mut http::Response<Bytes>),
+    ) -> Self {
+        self.response_preprocessor = Some(r);
         self
     }
 
@@ -65,6 +80,10 @@ impl TestClientBuilder {
             .homeserver_url(homeserver_url)
             .sliding_sync_proxy(sliding_sync_proxy_url)
             .request_config(RequestConfig::short_retry());
+
+        if let Some(response_preprocessor) = self.response_preprocessor {
+            client_builder = client_builder.response_preprocessor(response_preprocessor);
+        }
 
         if self.bootstrap_cross_signing {
             client_builder = client_builder.with_encryption_settings(
