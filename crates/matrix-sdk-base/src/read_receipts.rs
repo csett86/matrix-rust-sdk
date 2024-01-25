@@ -333,6 +333,8 @@ impl ReceiptSelector {
                 *best_pos = event_pos;
                 self.latest_event_with_receipt = Some(event_id.to_owned());
                 trace!("saving better");
+            } else {
+                trace!("not better, keeping previous");
             }
         } else {
             // We didn't have a previous receipt, this is the first one we
@@ -350,6 +352,7 @@ impl ReceiptSelector {
         pending.retain(|event_id| {
             if let Some(event_pos) = self.event_id_to_pos.get(event_id) {
                 // Maybe select this read receipt as it might be better than the ones we had.
+                trace!(%event_id, "matching event against its stashed receipt");
                 self.try_select_later(event_id, *event_pos);
 
                 // Remove this stashed read receipt from the pending list, as it's been
@@ -384,10 +387,12 @@ impl ReceiptSelector {
                 if let Some(receipt) = receipts.get(&ty).and_then(|receipts| receipts.get(user_id))
                 {
                     if matches!(receipt.thread, ReceiptThread::Main | ReceiptThread::Unthreaded) {
+                        trace!(%event_id, "found new candidate");
                         if let Some(event_pos) = self.event_id_to_pos.get(event_id) {
                             self.try_select_later(event_id, *event_pos);
                         } else {
                             // It's a new pending receipt.
+                            trace!(%event_id, "stashed as pending");
                             pending.push(event_id.clone());
                         }
                     }
