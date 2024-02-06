@@ -1,7 +1,12 @@
 use std::{convert::TryFrom, sync::Arc};
 
 use anyhow::{Context, Result};
-use matrix_sdk::{room::Room as SdkRoom, RoomMemberships, RoomNotableTags, RoomState};
+use eyeball_im::VectorDiff;
+use futures_util::{pin_mut, StreamExt};
+use matrix_sdk::{
+    room::{MemberListEntry as MatrixMemberListEntry, Room as SdkRoom},
+    RoomMemberships, RoomNotableTags, RoomState,
+};
 use matrix_sdk_ui::timeline::RoomExt;
 use mime::Mime;
 use ruma::{
@@ -10,6 +15,7 @@ use ruma::{
     events::room::{avatar::ImageInfo as RumaAvatarImageInfo, MediaSource},
     EventId, UserId,
 };
+use std::fmt::Debug;
 use tokio::sync::RwLock;
 use tracing::error;
 
@@ -19,7 +25,7 @@ use crate::{
     error::{ClientError, MediaInfoError, RoomError},
     event::{MessageLikeEventType, StateEventType},
     room_info::RoomInfo,
-    room_member::{MembershipState, MessageLikeEventType, RoomMember, StateEventType},
+    room_member::{MembershipState, RoomMember},
     ruma::ImageInfo,
     timeline::{EventTimelineItem, ReceiptType, Timeline},
     utils::u64_to_uint,
@@ -166,6 +172,29 @@ impl Room {
 
     pub async fn members(&self) -> Result<Arc<RoomMembersIterator>, ClientError> {
         Ok(Arc::new(RoomMembersIterator::new(self.inner.members(RoomMemberships::empty()).await?)))
+    }
+
+    pub async fn members_with_dynamic_adapters(
+        &self,
+        page_size: u32,
+        listener: Box<dyn MemberListEntriesListener>,
+    ) -> MemberListEntriesWithDynamicAdaptersResult {
+        let (entries_stream, dynamic_entries_controller) =
+            self.inner.members_with_dynamic_adapters(page_size.try_into().unwrap()).await;
+
+        MemberListEntriesWithDynamicAdaptersResult {
+            controller: Arc::new(MemberListDynamicEntriesController::new(
+                dynamic_entries_controller,
+                &self.inner.client(),
+            )),
+            entries_stream: Arc::new(TaskHandle::new(RUNTIME.spawn(async move {
+                pin_mut!(entries_stream);
+
+                while let Some(diff) = entries_stream.next().await {
+                    listener.on_update(diff.into_iter().map(Into::into).collect());
+                }
+            }))),
+        }
     }
 
     pub async fn members_no_sync(&self) -> Result<Arc<RoomMembersIterator>, ClientError> {
@@ -556,6 +585,75 @@ pub trait RoomInfoListener: Sync + Send {
     fn call(&self, room_info: RoomInfo);
 }
 
+#[derive(Clone, Debug, uniffi::Enum)]
+pub enum MemberListEntry {
+    Empty,
+    Filled { user_id: String },
+}
+
+impl From<MatrixMemberListEntry> for MemberListEntry {
+    fn from(value: MatrixMemberListEntry) -> Self {
+        (&value).into()
+    }
+}
+
+impl From<&MatrixMemberListEntry> for MemberListEntry {
+    fn from(value: &MatrixMemberListEntry) -> Self {
+        match value {
+            MatrixMemberListEntry::Empty => Self::Empty,
+            MatrixMemberListEntry::Filled(user_id) => Self::Filled { user_id: user_id.to_string() },
+        }
+    }
+}
+
+#[derive(uniffi::Enum)]
+pub enum MemberListEntriesUpdate {
+    Append { values: Vec<MemberListEntry> },
+    Clear,
+    PushFront { value: MemberListEntry },
+    PushBack { value: MemberListEntry },
+    PopFront,
+    PopBack,
+    Insert { index: u32, value: MemberListEntry },
+    Set { index: u32, value: MemberListEntry },
+    Remove { index: u32 },
+    Truncate { length: u32 },
+    Reset { values: Vec<MemberListEntry> },
+}
+
+impl From<VectorDiff<MatrixMemberListEntry>> for MemberListEntriesUpdate {
+    fn from(other: VectorDiff<MatrixMemberListEntry>) -> Self {
+        match other {
+            VectorDiff::Append { values } => {
+                Self::Append { values: values.into_iter().map(Into::into).collect() }
+            }
+            VectorDiff::Clear => Self::Clear,
+            VectorDiff::PushFront { value } => Self::PushFront { value: value.into() },
+            VectorDiff::PushBack { value } => Self::PushBack { value: value.into() },
+            VectorDiff::PopFront => Self::PopFront,
+            VectorDiff::PopBack => Self::PopBack,
+            VectorDiff::Insert { index, value } => {
+                Self::Insert { index: u32::try_from(index).unwrap(), value: value.into() }
+            }
+            VectorDiff::Set { index, value } => {
+                Self::Set { index: u32::try_from(index).unwrap(), value: value.into() }
+            }
+            VectorDiff::Remove { index } => Self::Remove { index: u32::try_from(index).unwrap() },
+            VectorDiff::Truncate { length } => {
+                Self::Truncate { length: u32::try_from(length).unwrap() }
+            }
+            VectorDiff::Reset { values } => {
+                Self::Reset { values: values.into_iter().map(Into::into).collect() }
+            }
+        }
+    }
+}
+
+#[uniffi::export(callback_interface)]
+pub trait MemberListEntriesListener: Send + Sync + Debug {
+    fn on_update(&self, member_entries_update: Vec<MemberListEntriesUpdate>);
+}
+
 #[uniffi::export(callback_interface)]
 pub trait RoomNotableTagsListener: Sync + Send {
     fn call(&self, notable_tags: RoomNotableTags);
@@ -571,6 +669,56 @@ pub struct ExportedRoomMember {
     power_level: i64,
     normalized_power_level: i64,
     is_ignored: bool,
+}
+
+#[derive(uniffi::Object)]
+pub struct MemberListDynamicEntriesController {
+    inner: matrix_sdk::room::MemberListDynamicEntriesController,
+    client: matrix_sdk::Client,
+}
+
+impl MemberListDynamicEntriesController {
+    fn new(
+        dynamic_entries_controller: matrix_sdk::room::MemberListDynamicEntriesController,
+        client: &matrix_sdk::Client,
+    ) -> Self {
+        Self { inner: dynamic_entries_controller, client: client.clone() }
+    }
+}
+
+#[uniffi::export]
+impl MemberListDynamicEntriesController {
+    /*
+    fn set_filter(&self, kind: MemberListEntriesDynamicFilterKind) -> bool {
+        use MemberListEntriesDynamicFilterKind as Kind;
+
+        match kind {
+            Kind::All => self.inner.set_filter(new_filter_all()),
+            Kind::AllNonLeft => self.inner.set_filter(new_filter_all_non_left(&self.client)),
+            Kind::None => self.inner.set_filter(new_filter_none()),
+            Kind::NormalizedMatchRoomName { pattern } => {
+                self.inner.set_filter(new_filter_normalized_match_room_name(&self.client, &pattern))
+            }
+            Kind::FuzzyMatchRoomName { pattern } => {
+                self.inner.set_filter(new_filter_fuzzy_match_room_name(&self.client, &pattern))
+            }
+        }
+    }
+    */
+
+    fn add_one_page(&self) {
+        self.inner.add_one_page();
+    }
+
+    fn reset_to_one_page(&self) {
+        self.inner.reset_to_one_page();
+    }
+}
+
+#[derive(uniffi::Record)]
+pub struct MemberListEntriesWithDynamicAdaptersResult {
+    pub controller: Arc<MemberListDynamicEntriesController>,
+    pub entries_stream: Arc<TaskHandle>,
 }
 
 #[derive(uniffi::Object)]
