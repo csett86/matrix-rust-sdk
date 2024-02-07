@@ -23,6 +23,7 @@ use zeroize::Zeroize;
 
 use crate::{
     ciphers::{AesHmacSha2Key, IV_SIZE, MAC_SIZE, SALT_SIZE},
+    file_encryption::IteratorSerializeAsArray,
     olm::ExportedRoomKey,
 };
 
@@ -131,15 +132,15 @@ pub fn decrypt_room_key_export(
 /// # let machine = OlmMachine::new(&alice, device_id!("DEVICEID")).await;
 /// let room_id = room_id!("!test:localhost");
 /// let exported_keys = machine.export_room_keys(|s| s.room_id() == room_id).await.unwrap();
-/// let encrypted_export = encrypt_room_key_export(&exported_keys, "1234", 1);
+/// let encrypted_export = encrypt_room_key_export(exported_keys.iter(), "1234", 1);
 /// # };
 /// ```
-pub fn encrypt_room_key_export(
-    keys: &[ExportedRoomKey],
+pub fn encrypt_room_key_export<'a>(
+    keys: impl Iterator<Item = &'a ExportedRoomKey>,
     passphrase: &str,
     rounds: u32,
 ) -> Result<String, SerdeError> {
-    let mut plaintext = serde_json::to_string(keys)?.into_bytes();
+    let mut plaintext = serde_json::to_string(&IteratorSerializeAsArray::new(keys))?.into_bytes();
     let ciphertext = encrypt_helper(&plaintext, passphrase, rounds);
 
     plaintext.zeroize();
@@ -297,7 +298,7 @@ mod tests {
 
         assert!(!export.is_empty());
 
-        let encrypted = encrypt_room_key_export(&export, "1234", 1).unwrap();
+        let encrypted = encrypt_room_key_export(export.iter(), "1234", 1).unwrap();
         let decrypted = decrypt_room_key_export(Cursor::new(encrypted), "1234").unwrap();
 
         for (exported, decrypted) in export.iter().zip(decrypted.iter()) {

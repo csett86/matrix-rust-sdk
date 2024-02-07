@@ -919,7 +919,7 @@ impl OlmMachine {
     ) -> Result<String, CryptoStoreError> {
         let keys = self.runtime.block_on(self.inner.export_room_keys(|_| true))?;
 
-        let encrypted = encrypt_room_key_export(&keys, &passphrase, rounds as u32)
+        let encrypted = encrypt_room_key_export(keys.iter(), &passphrase, rounds as u32)
             .map_err(CryptoStoreError::Serialization)?;
 
         Ok(encrypted)
